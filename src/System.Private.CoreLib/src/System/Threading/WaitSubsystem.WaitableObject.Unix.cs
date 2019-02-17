@@ -228,7 +228,7 @@ namespace System.Threading
                 }
             }
 
-            public bool Wait(ThreadWaitInfo waitInfo, int timeoutMilliseconds, bool interruptible, bool prioritize)
+            public int Wait(ThreadWaitInfo waitInfo, int timeoutMilliseconds, bool interruptible, bool prioritize)
             {
                 Debug.Assert(waitInfo != null);
                 Debug.Assert(waitInfo.Thread == RuntimeThread.CurrentThread);
@@ -250,7 +250,7 @@ namespace System.Threading
             /// This function does not check for a pending thread interrupt. Callers are expected to do that soon after
             /// acquiring <see cref="s_lock"/>.
             /// </summary>
-            public bool Wait_Locked(ThreadWaitInfo waitInfo, int timeoutMilliseconds, bool interruptible, bool prioritize)
+            public int Wait_Locked(ThreadWaitInfo waitInfo, int timeoutMilliseconds, bool interruptible, bool prioritize)
             {
                 s_lock.VerifyIsLocked();
                 Debug.Assert(waitInfo != null);
@@ -266,11 +266,7 @@ namespace System.Threading
                     {
                         bool isAbandoned = IsAbandonedMutex;
                         AcceptSignal(waitInfo);
-                        if (isAbandoned)
-                        {
-                            throw new AbandonedMutexException();
-                        }
-                        return true;
+                        return isAbandoned ? WaitHandle.WaitAbandoned : 0;
                     }
 
                     if (IsMutex && _ownershipInfo.Thread == waitInfo.Thread)
@@ -280,12 +276,12 @@ namespace System.Threading
                             throw new OverflowException(SR.Overflow_MutexReacquireCount);
                         }
                         _ownershipInfo.IncrementReacquireCount();
-                        return true;
+                        return 0;
                     }
 
                     if (timeoutMilliseconds == 0)
                     {
-                        return false;
+                        return WaitHandle.WaitTimeout;
                     }
 
                     WaitableObject[] waitableObjects = waitInfo.GetWaitedObjectArray(1);
@@ -306,7 +302,7 @@ namespace System.Threading
                     waitInfo.Wait(
                         timeoutMilliseconds,
                         interruptible,
-                        isSleep: false) != WaitHandle.WaitTimeout;
+                        isSleep: false);
             }
 
             public static int Wait(

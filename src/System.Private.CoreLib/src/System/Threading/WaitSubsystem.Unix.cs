@@ -171,7 +171,7 @@ namespace System.Threading
             /// by the thread. See <see cref="ThreadWaitInfo.LockedMutexesHead"/>. So, acquire the lock only after all
             /// possibilities for exceptions have been exhausted.
             ThreadWaitInfo waitInfo = RuntimeThread.CurrentThread.WaitInfo;
-            bool acquiredLock = waitableObject.Wait(waitInfo, timeoutMilliseconds: 0, interruptible: false, prioritize: false);
+            bool acquiredLock = waitableObject.Wait(waitInfo, timeoutMilliseconds: 0, interruptible: false, prioritize: false) == 0;
             Debug.Assert(acquiredLock);
             return safeWaitHandle;
         }
@@ -263,13 +263,13 @@ namespace System.Threading
             }
         }
 
-        public static bool Wait(IntPtr handle, int timeoutMilliseconds, bool interruptible)
+        public static int Wait(IntPtr handle, int timeoutMilliseconds, bool interruptible)
         {
             Debug.Assert(timeoutMilliseconds >= -1);
             return Wait(HandleManager.FromHandle(handle), timeoutMilliseconds, interruptible);
         }
 
-        public static bool Wait(
+        public static int Wait(
             WaitableObject waitableObject,
             int timeoutMilliseconds,
             bool interruptible = true,
@@ -337,9 +337,7 @@ namespace System.Threading
                 WaitableObject waitableObject = waitableObjects[0];
                 waitableObjects[0] = null;
                 return
-                    waitableObject.Wait(waitInfo, timeoutMilliseconds, interruptible: true, prioritize : false)
-                        ? 0
-                        : WaitHandle.WaitTimeout;
+                    waitableObject.Wait(waitInfo, timeoutMilliseconds, interruptible: true, prioritize : false);
             }
 
             return
@@ -384,7 +382,7 @@ namespace System.Threading
                     prioritize);
         }
 
-        public static bool SignalAndWait(
+        public static int SignalAndWait(
             IntPtr handleToSignal,
             IntPtr handleToWaitOn,
             int timeoutMilliseconds)
@@ -398,7 +396,7 @@ namespace System.Threading
                     timeoutMilliseconds);
         }
 
-        public static bool SignalAndWait(
+        public static int SignalAndWait(
             WaitableObject waitableObjectToSignal,
             WaitableObject waitableObjectToWaitOn,
             int timeoutMilliseconds,

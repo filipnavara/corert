@@ -10,12 +10,12 @@ namespace System.Threading
     public abstract partial class WaitHandle
     {
         private static int WaitOneCore(IntPtr handle, int millisecondsTimeout) =>
-            WaitSubsystem.Wait(handle, millisecondsTimeout, true) ? 0 : WaitHandle.WaitTimeout;
+            WaitSubsystem.Wait(handle, millisecondsTimeout, true);
 
         internal static int WaitMultipleIgnoringSyncContext(IntPtr[] handles, bool waitAll, int millisecondsTimeout) =>
             WaitSubsystem.Wait(handles, handles.Length, true, millisecondsTimeout);
 
         private static int SignalAndWaitCore(IntPtr handleToSignal, IntPtr handleToWaitOn, int millisecondsTimeout) =>
-            WaitSubsystem.SignalAndWait(handleToSignal, handleToWaitOn, millisecondsTimeout) ? 0 : WaitHandle.WaitTimeout;
+            WaitSubsystem.SignalAndWait(handleToSignal, handleToWaitOn, millisecondsTimeout);
     }
 }
