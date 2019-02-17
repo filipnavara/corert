@@ -2,29 +2,23 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 // See the LICENSE file in the project root for more information.
 
-/*=============================================================================
-**
-**
-**
-** Purpose: Class to represent all synchronization objects in the runtime (that allow multiple wait)
-**
-**
-=============================================================================*/
-
 using System.Diagnostics;
-using System.Diagnostics.CodeAnalysis;
-using System.Runtime.InteropServices;
-using Internal.Runtime.Augments;
 using Microsoft.Win32.SafeHandles;
 
 namespace System.Threading
 {
     public abstract partial class WaitHandle : MarshalByRefObject, IDisposable
     {
-        public const int WaitTimeout = 0x102;
-        protected static readonly IntPtr InvalidHandle = new IntPtr(-1);
+        internal const int WaitAbandoned = 0x80;
+        internal const int WaitTimeout = 0x102;
+        internal const int ErrorTooManyPosts = 0x12A;
 
         internal const int MaxWaitHandles = 64;
+
+        protected static readonly IntPtr InvalidHandle = new IntPtr(-1);
+
+        // IMPORTANT:
+        // - Do not add or rearrange fields as the EE depends on this layout.
 
         internal SafeWaitHandle _waitHandle;
 
@@ -88,11 +82,31 @@ namespace System.Threading
         internal static int ToTimeoutMilliseconds(TimeSpan timeout)
         {
             var timeoutMilliseconds = (long)timeout.TotalMilliseconds;
-            if (timeoutMilliseconds < -1 || timeoutMilliseconds > int.MaxValue)
+            if (timeoutMilliseconds < -1)
             {
                 throw new ArgumentOutOfRangeException(nameof(timeout), SR.ArgumentOutOfRange_NeedNonNegOrNegative1);
             }
+            if (timeoutMilliseconds > int.MaxValue)
+            {
+                throw new ArgumentOutOfRangeException(nameof(timeout), SR.ArgumentOutOfRange_LessEqualToIntegerMaxVal);
+            }
             return (int)timeoutMilliseconds;
+        }
+
+        public virtual void Close() => Dispose();
+
+        protected virtual void Dispose(bool explicitDisposing)
+        {
+            if (_waitHandle != null)
+            {
+                _waitHandle.Close();
+            }
+        }
+
+        public void Dispose()
+        {
+            Dispose(true);
+            GC.SuppressFinalize(this);
         }
 
         public virtual bool WaitOne(int millisecondsTimeout)
@@ -101,13 +115,6 @@ namespace System.Threading
             {
                 throw new ArgumentOutOfRangeException(nameof(millisecondsTimeout), SR.ArgumentOutOfRange_NeedNonNegOrNegative1);
             }
-
-            return WaitOneCore(millisecondsTimeout);
-        }
-
-        private bool WaitOneCore(int millisecondsTimeout, bool interruptible = true)
-        {
-            Debug.Assert(millisecondsTimeout >= -1);
 
             // The field value is modifiable via the public <see cref="WaitHandle.SafeWaitHandle"/> property, save it locally
             // to ensure that one instance is used in all places in this method
@@ -118,46 +125,58 @@ namespace System.Threading
                 throw new ObjectDisposedException(null, SR.ObjectDisposed_Generic);
             }
 
-            waitHandle.DangerousAddRef();
+            bool success = false;
+            waitHandle.DangerousAddRef(ref success);
             try
             {
-                return WaitOneCore(waitHandle.DangerousGetHandle(), millisecondsTimeout, interruptible);
+                int waitResult;
+
+                SynchronizationContext context = SynchronizationContext.Current;
+                if (context != null && context.IsWaitNotificationRequired())
+                {
+                    var handles = new[] { waitHandle.DangerousGetHandle() };
+                    waitResult = context.Wait(handles, false, millisecondsTimeout);
+                    GC.KeepAlive(handles);
+                }
+                else
+                {
+                    waitResult = WaitOneCore(waitHandle.DangerousGetHandle(), millisecondsTimeout);
+                }
+
+                if (waitResult == WaitAbandoned)
+                {
+                    throw new AbandonedMutexException();
+                }
+
+                return waitResult != WaitTimeout;
             }
             finally
             {
-                waitHandle.DangerousRelease();
+                if (success)
+                    waitHandle.DangerousRelease();
             }
         }
-
-        public virtual bool WaitOne(TimeSpan timeout) => WaitOneCore(ToTimeoutMilliseconds(timeout));
-        public virtual bool WaitOne() => WaitOneCore(Timeout.Infinite);
-
-        public virtual bool WaitOne(int millisecondsTimeout, bool exitContext) => WaitOne(millisecondsTimeout);
-        public virtual bool WaitOne(TimeSpan timeout, bool exitContext) => WaitOne(timeout);
 
         /// <summary>
         /// Obtains all of the corresponding safe wait handles and adds a ref to each. Since the <see cref="SafeWaitHandle"/>
         /// property is publically modifiable, this makes sure that we add and release refs one the same set of safe wait
         /// handles to keep them alive during a multi-wait operation.
         /// </summary>
-        private static SafeWaitHandle[] ObtainSafeWaitHandles(
-            RuntimeThread currentThread,
-            WaitHandle[] waitHandles,
-            int numWaitHandles,
-            out SafeWaitHandle[] rentedSafeWaitHandles)
+        private static void ObtainSafeWaitHandles(
+            Span<WaitHandle> waitHandles,
+            out SafeWaitHandle[] safeWaitHandles,
+            out IntPtr[] unsafeWaitHandles)
         {
-            Debug.Assert(currentThread == RuntimeThread.CurrentThread);
             Debug.Assert(waitHandles != null);
-            Debug.Assert(numWaitHandles > 0);
-            Debug.Assert(numWaitHandles <= MaxWaitHandles);
-            Debug.Assert(numWaitHandles <= waitHandles.Length);
+            Debug.Assert(waitHandles.Length > 0);
+            Debug.Assert(waitHandles.Length <= MaxWaitHandles);
 
-            rentedSafeWaitHandles = currentThread.RentWaitedSafeWaitHandleArray(numWaitHandles);
-            SafeWaitHandle[] safeWaitHandles = rentedSafeWaitHandles ?? new SafeWaitHandle[numWaitHandles];
+            safeWaitHandles = new SafeWaitHandle[waitHandles.Length];
+            unsafeWaitHandles = new IntPtr[waitHandles.Length];
             bool success = false;
             try
             {
-                for (int i = 0; i < numWaitHandles; ++i)
+                for (int i = 0; i < waitHandles.Length; ++i)
                 {
                     WaitHandle waitHandle = waitHandles[i];
                     if (waitHandle == null)
@@ -172,8 +191,9 @@ namespace System.Threading
                         throw new ObjectDisposedException(null, SR.ObjectDisposed_Generic);
                     }
 
-                    safeWaitHandle.DangerousAddRef();
+                    safeWaitHandle.DangerousAddRef(ref success);
                     safeWaitHandles[i] = safeWaitHandle;
+                    unsafeWaitHandles[i] = safeWaitHandle.DangerousGetHandle();
                 }
                 success = true;
             }
@@ -181,7 +201,7 @@ namespace System.Threading
             {
                 if (!success)
                 {
-                    for (int i = 0; i < numWaitHandles; ++i)
+                    for (int i = 0; i < waitHandles.Length; ++i)
                     {
                         SafeWaitHandle safeWaitHandle = safeWaitHandles[i];
                         if (safeWaitHandle == null)
@@ -191,18 +211,11 @@ namespace System.Threading
                         safeWaitHandle.DangerousRelease();
                         safeWaitHandles[i] = null;
                     }
-
-                    if (rentedSafeWaitHandles != null)
-                    {
-                        currentThread.ReturnWaitedSafeWaitHandleArray(rentedSafeWaitHandles);
-                    }
                 }
             }
-
-            return safeWaitHandles;
         }
 
-        public static bool WaitAll(WaitHandle[] waitHandles, int millisecondsTimeout)
+        private static int WaitMultiple(Span<WaitHandle> waitHandles, bool waitAll, int millisecondsTimeout)
         {
             if (waitHandles == null)
             {
@@ -219,7 +232,7 @@ namespace System.Threading
                 // in CoreCLR, and ArgumentNullException in the desktop CLR.  This is ugly, but so is breaking
                 // user code.
                 //
-                throw new ArgumentNullException(nameof(waitHandles), SR.Argument_EmptyWaithandleArray);
+                throw new ArgumentException(SR.Argument_EmptyWaithandleArray, nameof(waitHandles));
             }
             if (waitHandles.Length > MaxWaitHandles)
             {
@@ -230,12 +243,37 @@ namespace System.Threading
                 throw new ArgumentOutOfRangeException(nameof(millisecondsTimeout), SR.ArgumentOutOfRange_NeedNonNegOrNegative1);
             }
 
-            RuntimeThread currentThread = RuntimeThread.CurrentThread;
-            SafeWaitHandle[] rentedSafeWaitHandles;
-            SafeWaitHandle[] safeWaitHandles = ObtainSafeWaitHandles(currentThread, waitHandles, waitHandles.Length, out rentedSafeWaitHandles);
+            ObtainSafeWaitHandles(waitHandles, out SafeWaitHandle[] safeWaitHandles, out IntPtr[] unsafeWaitHandles);
             try
             {
-                return WaitAllCore(currentThread, safeWaitHandles, waitHandles, millisecondsTimeout);
+                int waitResult;
+
+                SynchronizationContext context = SynchronizationContext.Current;
+                if (context != null && context.IsWaitNotificationRequired())
+                {
+                    waitResult = context.Wait(unsafeWaitHandles, waitAll, millisecondsTimeout);
+                }
+                else
+                {
+                    waitResult = WaitMultipleIgnoringSyncContext(unsafeWaitHandles, waitAll, millisecondsTimeout);
+                }
+
+                if (waitResult >= WaitAbandoned && waitResult < WaitAbandoned + unsafeWaitHandles.Length)
+                {
+                    if (waitAll)
+                    {
+                        // In the case of WaitAll the OS will only provide the information that mutex was abandoned.
+                        // It won't tell us which one.  So we can't set the Index or provide access to the Mutex
+                        throw new AbandonedMutexException();
+                    }
+
+                    waitResult -= WaitAbandoned;
+                    throw new AbandonedMutexException(waitResult, waitHandles[waitResult]);
+                }
+
+                GC.KeepAlive(unsafeWaitHandles);
+
+                return waitResult;
             }
             finally
             {
@@ -244,87 +282,8 @@ namespace System.Threading
                     safeWaitHandles[i].DangerousRelease();
                     safeWaitHandles[i] = null;
                 }
-
-                if (rentedSafeWaitHandles != null)
-                {
-                    currentThread.ReturnWaitedSafeWaitHandleArray(rentedSafeWaitHandles);
-                }
             }
         }
-
-        public static bool WaitAll(WaitHandle[] waitHandles, TimeSpan timeout) =>
-            WaitAll(waitHandles, ToTimeoutMilliseconds(timeout));
-        public static bool WaitAll(WaitHandle[] waitHandles) => WaitAll(waitHandles, Timeout.Infinite);
-
-        public static bool WaitAll(WaitHandle[] waitHandles, int millisecondsTimeout, bool exitContext) =>
-            WaitAll(waitHandles, millisecondsTimeout);
-        public static bool WaitAll(WaitHandle[] waitHandles, TimeSpan timeout, bool exitContext) =>
-            WaitAll(waitHandles, timeout);
-
-        /*========================================================================
-        ** Waits for notification from any of the objects. 
-        ** timeout indicates how long to wait before the method returns.
-        ** This method will return either when either one of the object have been 
-        ** signalled or timeout milliseonds have elapsed.
-        ========================================================================*/
-
-        public static int WaitAny(WaitHandle[] waitHandles, int millisecondsTimeout) => WaitAny(waitHandles, waitHandles?.Length ?? 0, millisecondsTimeout);
-
-        internal static int WaitAny(WaitHandle[] waitHandles, int numWaitHandles, int millisecondsTimeout)
-        {
-            if (waitHandles == null)
-            {
-                throw new ArgumentNullException(nameof(waitHandles), SR.ArgumentNull_Waithandles);
-            }
-            if (waitHandles.Length == 0)
-            {
-                throw new ArgumentException(SR.Argument_EmptyWaithandleArray);
-            }
-            if (MaxWaitHandles < waitHandles.Length)
-            {
-                throw new NotSupportedException(SR.NotSupported_MaxWaitHandles);
-            }
-            if (-1 > millisecondsTimeout)
-            {
-                throw new ArgumentOutOfRangeException(nameof(millisecondsTimeout), SR.ArgumentOutOfRange_NeedNonNegOrNegative1);
-            }
-
-            RuntimeThread currentThread = RuntimeThread.CurrentThread;
-            SafeWaitHandle[] rentedSafeWaitHandles;
-            SafeWaitHandle[] safeWaitHandles = ObtainSafeWaitHandles(currentThread, waitHandles, numWaitHandles, out rentedSafeWaitHandles);
-            try
-            {
-                return WaitAnyCore(currentThread, safeWaitHandles, waitHandles, numWaitHandles, millisecondsTimeout);
-            }
-            finally
-            {
-                for (int i = 0; i < numWaitHandles; ++i)
-                {
-                    safeWaitHandles[i].DangerousRelease();
-                    safeWaitHandles[i] = null;
-                }
-
-                if (rentedSafeWaitHandles != null)
-                {
-                    currentThread.ReturnWaitedSafeWaitHandleArray(rentedSafeWaitHandles);
-                }
-            }
-        }
-
-        public static int WaitAny(WaitHandle[] waitHandles, TimeSpan timeout) =>
-            WaitAny(waitHandles, ToTimeoutMilliseconds(timeout));
-        public static int WaitAny(WaitHandle[] waitHandles) => WaitAny(waitHandles, Timeout.Infinite);
-
-        public static int WaitAny(WaitHandle[] waitHandles, int millisecondsTimeout, bool exitContext) =>
-            WaitAny(waitHandles, millisecondsTimeout);
-        public static int WaitAny(WaitHandle[] waitHandles, TimeSpan timeout, bool exitContext) =>
-            WaitAny(waitHandles, timeout);
-
-        /*=================================================
-        ==
-        ==  SignalAndWait
-        ==
-        ==================================================*/
 
         private static bool SignalAndWait(WaitHandle toSignal, WaitHandle toWaitOn, int millisecondsTimeout)
         {
@@ -351,59 +310,75 @@ namespace System.Threading
                 throw new ObjectDisposedException(null, SR.ObjectDisposed_Generic);
             }
 
-
-            safeWaitHandleToSignal.DangerousAddRef();
+            bool successSignal = false, successWait = false;
+            int ret;
             try
             {
-                safeWaitHandleToWaitOn.DangerousAddRef();
-                try
+                safeWaitHandleToSignal.DangerousAddRef(ref successSignal);
+                safeWaitHandleToWaitOn.DangerousAddRef(ref successWait);
+
+                ret = SignalAndWaitCore(
+                    safeWaitHandleToSignal.DangerousGetHandle(),
+                    safeWaitHandleToWaitOn.DangerousGetHandle(),
+                    millisecondsTimeout);
+
+                if (ret == WaitAbandoned)
                 {
-                    return
-                        SignalAndWaitCore(
-                            safeWaitHandleToSignal.DangerousGetHandle(),
-                            safeWaitHandleToWaitOn.DangerousGetHandle(),
-                            millisecondsTimeout);
+                    throw new AbandonedMutexException();
                 }
-                finally
+
+                if (ret == ErrorTooManyPosts)
                 {
-                    safeWaitHandleToWaitOn.DangerousRelease();
+                    throw new InvalidOperationException(SR.Threading_WaitHandleTooManyPosts);
                 }
+
+                return ret != WaitTimeout;
             }
             finally
             {
-                safeWaitHandleToSignal.DangerousRelease();
+                if (successWait)
+                {
+                    safeWaitHandleToWaitOn.DangerousRelease();
+                }
+                if (successSignal)
+                {
+                    safeWaitHandleToSignal.DangerousRelease();
+                }
             }
         }
+
+        public virtual bool WaitOne(TimeSpan timeout) => WaitOne(ToTimeoutMilliseconds(timeout));
+        public virtual bool WaitOne() => WaitOne(-1);
+        public virtual bool WaitOne(int millisecondsTimeout, bool exitContext) => WaitOne(millisecondsTimeout);
+        public virtual bool WaitOne(TimeSpan timeout, bool exitContext) => WaitOne(ToTimeoutMilliseconds(timeout));
+
+        public static bool WaitAll(WaitHandle[] waitHandles, int millisecondsTimeout) =>
+            WaitMultiple(waitHandles, true, millisecondsTimeout) != WaitTimeout;
+        public static bool WaitAll(WaitHandle[] waitHandles, TimeSpan timeout) =>
+            WaitMultiple(waitHandles, true, ToTimeoutMilliseconds(timeout)) != WaitTimeout;
+        public static bool WaitAll(WaitHandle[] waitHandles) =>
+            WaitMultiple(waitHandles, true, -1) != WaitTimeout;
+        public static bool WaitAll(WaitHandle[] waitHandles, int millisecondsTimeout, bool exitContext) =>
+            WaitMultiple(waitHandles, true, millisecondsTimeout) != WaitTimeout;
+        public static bool WaitAll(WaitHandle[] waitHandles, TimeSpan timeout, bool exitContext) =>
+            WaitMultiple(waitHandles, true, ToTimeoutMilliseconds(timeout)) != WaitTimeout;
+
+        public static int WaitAny(WaitHandle[] waitHandles, int millisecondsTimeout) =>
+            WaitMultiple(waitHandles, false, millisecondsTimeout);
+        public static int WaitAny(WaitHandle[] waitHandles, TimeSpan timeout) =>
+            WaitMultiple(waitHandles, false, ToTimeoutMilliseconds(timeout));
+        public static int WaitAny(WaitHandle[] waitHandles) =>
+            WaitMultiple(waitHandles, false, -1);
+        public static int WaitAny(WaitHandle[] waitHandles, int millisecondsTimeout, bool exitContext) =>
+            WaitMultiple(waitHandles, false, millisecondsTimeout);
+        public static int WaitAny(WaitHandle[] waitHandles, TimeSpan timeout, bool exitContext) =>
+            WaitMultiple(waitHandles, false, ToTimeoutMilliseconds(timeout));
 
         public static bool SignalAndWait(WaitHandle toSignal, WaitHandle toWaitOn) =>
-            SignalAndWait(toSignal, toWaitOn, Timeout.Infinite);
+            SignalAndWait(toSignal, toWaitOn, -1);
         public static bool SignalAndWait(WaitHandle toSignal, WaitHandle toWaitOn, TimeSpan timeout, bool exitContext) =>
             SignalAndWait(toSignal, toWaitOn, ToTimeoutMilliseconds(timeout));
-        [SuppressMessage("Microsoft.Concurrency", "CA8001", Justification = "Reviewed for thread-safety.")]
         public static bool SignalAndWait(WaitHandle toSignal, WaitHandle toWaitOn, int millisecondsTimeout, bool exitContext) =>
             SignalAndWait(toSignal, toWaitOn, millisecondsTimeout);
-
-        public virtual void Close() => Dispose();
-
-        protected virtual void Dispose(bool explicitDisposing)
-        {
-            if (_waitHandle != null)
-            {
-                _waitHandle.Close();
-            }
-        }
-
-        public void Dispose()
-        {
-            Dispose(true);
-            GC.SuppressFinalize(this);
-        }
-
-        internal static void ThrowInvalidHandleException()
-        {
-            var ex = new InvalidOperationException(SR.InvalidOperation_InvalidHandle);
-            ex.HResult = HResults.E_HANDLE;
-            throw ex;
-        }
     }
 }

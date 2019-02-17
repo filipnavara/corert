@@ -306,7 +306,6 @@ namespace System.Threading
                     waitInfo.Wait(
                         timeoutMilliseconds,
                         interruptible,
-                        waitHandlesForAbandon: null,
                         isSleep: false) != WaitHandle.WaitTimeout;
             }
 
@@ -317,8 +316,7 @@ namespace System.Threading
                 ThreadWaitInfo waitInfo,
                 int timeoutMilliseconds,
                 bool interruptible,
-                bool prioritize,
-                WaitHandle[] waitHandlesForAbandon)
+                bool prioritize)
             {
                 s_lock.VerifyIsNotLocked();
                 Debug.Assert(waitInfo != null);
@@ -352,14 +350,7 @@ namespace System.Threading
                                 waitableObject.AcceptSignal(waitInfo);
                                 if (isAbandoned)
                                 {
-                                    if (waitHandlesForAbandon == null)
-                                    {
-                                        throw new AbandonedMutexException();
-                                    }
-                                    else
-                                    {
-                                        throw new AbandonedMutexException(i, waitHandlesForAbandon[i]);
-                                    }
+                                    return WaitHandle.WaitAbandoned + i;
                                 }
                                 return i;
                             }
@@ -466,7 +457,7 @@ namespace System.Threading
                     }
                 }
 
-                return waitInfo.Wait(timeoutMilliseconds, interruptible, waitHandlesForAbandon, isSleep: false);
+                return waitInfo.Wait(timeoutMilliseconds, interruptible, isSleep: false);
             }
 
             public static bool WouldWaitForAllBeSatisfiedOrAborted(
