@@ -17,6 +17,7 @@ namespace System.Threading
     internal partial class TimerQueue : IThreadPoolWorkItem
     {
         private static List<ScheduledTimer> s_scheduledTimers;
+        private static List<int> s_timerIDsToFire;
 
         /// <summary>
         /// This event is used by the timer thread to wait for timer expiration. It is also
@@ -36,6 +37,10 @@ namespace System.Threading
             Debug.Assert(s_scheduledTimers == null);
 
             var scheduledTimers = new List<ScheduledTimer>(Instances.Length);
+            if (s_timerIDsToFire == null)
+            {
+                s_timerIDsToFire = new List<int>(Instances.Length);
+            }
 
             RuntimeThread timerThread = RuntimeThread.Create(TimerThread);
             timerThread.IsBackground = true;
@@ -73,6 +78,7 @@ namespace System.Threading
         private static void TimerThread()
         {
             AutoResetEvent timerEvent = s_timerEvent;
+            List<int> timerIDsToFire = s_timerIDsToFire;
             List<ScheduledTimer> timers;
             lock (timerEvent)
             {
@@ -93,7 +99,7 @@ namespace System.Threading
                         int waitDurationMs = timers[i].dueTimeMs - currentTimeMs;
                         if (waitDurationMs <= 0)
                         {
-                            ThreadPool.UnsafeQueueUserWorkItemInternal(Instances[timers[i].id], preferLocal: false);
+                            timerIDsToFire.Add(timers[i].id);
 
                             int lastIndex = timers.Count - 1;
                             if (i != lastIndex)
@@ -109,6 +115,15 @@ namespace System.Threading
                             shortestWaitDurationMs = waitDurationMs;
                         }
                     }
+                }
+
+                if (timerIDsToFire.Count > 0)
+                {
+                    foreach (int timerIDToFire in timerIDsToFire)
+                    {
+                        ThreadPool.UnsafeQueueUserWorkItemInternal(Instances[timerIDToFire], preferLocal: false);
+                    }
+                    timerIDsToFire.Clear();
                 }
 
                 if (shortestWaitDurationMs == int.MaxValue)
