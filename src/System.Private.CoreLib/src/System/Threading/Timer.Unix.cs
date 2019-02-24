@@ -16,7 +16,6 @@ namespace System.Threading
     //
     internal partial class TimerQueue : IThreadPoolWorkItem
     {
-        private static List<ScheduledTimer> s_scheduledTimers;
         private static List<int> s_timerIDsToFire;
 
         /// <summary>
@@ -25,39 +24,29 @@ namespace System.Threading
         /// </summary>
         private static readonly AutoResetEvent s_timerEvent = new AutoResetEvent(false);
 
-        private static List<ScheduledTimer> InitializeScheduledTimerManager_Locked()
-        {
-            Debug.Assert(s_scheduledTimers == null);
+        private int _nextTimerDue = -1;
 
-            var scheduledTimers = new List<ScheduledTimer>(Instances.Length);
+        private static void EnsureTimerThreadInitialized()
+        {
             if (s_timerIDsToFire == null)
             {
-                s_timerIDsToFire = new List<int>(Instances.Length);
+                RuntimeThread timerThread = RuntimeThread.Create(TimerThread);
+                timerThread.IsBackground = true;
+                timerThread.Start();
+
+                s_timerIDsToFire = new List<int>(Instances.Count);
             }
-
-            RuntimeThread timerThread = RuntimeThread.Create(TimerThread);
-            timerThread.IsBackground = true;
-            timerThread.Start();
-
-            // Do this after creating the thread in case thread creation fails so that it will try again next time
-            s_scheduledTimers = scheduledTimers;
-            return scheduledTimers;
         }
 
         private bool SetTimer(uint actualDuration)
         {
             Debug.Assert((int)actualDuration >= 0);
-            var timer = new ScheduledTimer(_id, TickCount + (int)actualDuration);
             AutoResetEvent timerEvent = s_timerEvent;
+
             lock (timerEvent)
             {
-                List<ScheduledTimer> timers = s_scheduledTimers;
-                if (timers == null)
-                {
-                    timers = InitializeScheduledTimerManager_Locked();
-                }
-
-                timers.Add(timer);
+                _nextTimerDue = TickCount + (int)actualDuration;
+                EnsureTimerThreadInitialized();
             }
 
             timerEvent.Set();
@@ -71,11 +60,10 @@ namespace System.Threading
         private static void TimerThread()
         {
             AutoResetEvent timerEvent = s_timerEvent;
-            List<int> timerIDsToFire = s_timerIDsToFire;
-            List<ScheduledTimer> timers;
+            List<int> timerIDsToFire;
             lock (timerEvent)
             {
-                timers = s_scheduledTimers;
+                timerIDsToFire = s_timerIDsToFire;
             }
 
             int shortestWaitDurationMs = Timeout.Infinite;
@@ -87,25 +75,20 @@ namespace System.Threading
                 shortestWaitDurationMs = int.MaxValue;
                 lock (timerEvent)
                 {
-                    for (int i = timers.Count - 1; i >= 0; --i)
+                    for (int i = Instances.Count - 1; i >= 0; --i)
                     {
-                        int waitDurationMs = timers[i].dueTimeMs - currentTimeMs;
-                        if (waitDurationMs <= 0)
+                        if (Instances[i]._nextTimerDue != -1)
                         {
-                            timerIDsToFire.Add(timers[i].id);
-
-                            int lastIndex = timers.Count - 1;
-                            if (i != lastIndex)
+                            int waitDurationMs = Instances[i]._nextTimerDue - currentTimeMs;
+                            if (waitDurationMs <= 0)
                             {
-                                timers[i] = timers[lastIndex];
+                                Instances[i]._nextTimerDue = -1;
+                                timerIDsToFire.Add(timers[i].id);
                             }
-                            timers.RemoveAt(lastIndex);
-                            continue;
-                        }
-
-                        if (waitDurationMs < shortestWaitDurationMs)
-                        {
-                            shortestWaitDurationMs = waitDurationMs;
+                            else if (waitDurationMs < shortestWaitDurationMs)
+                            {
+                                shortestWaitDurationMs = waitDurationMs;
+                            }
                         }
                     }
                 }
@@ -128,21 +111,5 @@ namespace System.Threading
 
         private static int TickCount => Environment.TickCount;
         void IThreadPoolWorkItem.Execute() => FireNextTimers();
-
-        private struct ScheduledTimer
-        {
-            public int id;
-            public int dueTimeMs;
-
-            public ScheduledTimer(int id, int dueTimeMs)
-            {
-                Debug.Assert(id >= 0);
-                Debug.Assert(id < Instances.Length);
-                Debug.Assert(id == Instances[id]._id);
-
-                this.id = id;
-                this.dueTimeMs = dueTimeMs;
-            }
-        }
     }
 }
